@@ -12,7 +12,6 @@ face_cascade = cv2.CascadeClassifier(
 MODEL_PATH = "face_model.xml"
 
 
-# 🔥 Improve lighting robustness
 def preprocess_face(gray):
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     return clahe.apply(gray)
@@ -30,9 +29,15 @@ def build_db(database_path="database", model_path=MODEL_PATH):
 
         print(f"[DB] Folder: {folder_name}")
         for file in files:
-            if file.lower().endswith((".jpg", ".png", ".jpeg")):
+            if file.lower().endswith((".jpg", ".png", ".jpeg", ".webp")):
                 path = os.path.join(root, file)
-                img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+
+                img_array = np.fromfile(path, dtype=np.uint8)
+                img = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
+
+                if img is None:
+                    print(f"[DB] Could not read: {path}")
+                    continue
 
                 detected = face_cascade.detectMultiScale(
                     img, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40)
@@ -52,7 +57,11 @@ def build_db(database_path="database", model_path=MODEL_PATH):
                 if folder_name not in label_dict:
                     label_dict[folder_name] = current_id
                     current_id += 1
-                labels.extend([label_dict[folder_name]] * len(detected or [0]))
+                labels.extend([label_dict[folder_name]] * max(1, len(detected)))
+
+    if len(faces) == 0:
+        print("[DB] No faces found!")
+        return
 
     recognizer.train(faces, np.array(labels))
     recognizer.save(model_path)
@@ -85,7 +94,6 @@ def recognize_face(person_crop, recognizer, id_to_name, threshold=65):
             best_result = (name, conf, (x, y, w, h))
 
     name, conf, (x, y, w, h) = best_result
-
     matched = conf < threshold
     if not matched:
         name = "Unknown"
@@ -110,13 +118,16 @@ def main(source, build_db_flag=False):
 
     print("[SYSTEM] Ready")
 
-    model = YOLO("yolov8n.pt")
+    model = YOLO("yolo12n.pt")
 
     cap = cv2.VideoCapture(source)
-    cap.set(3, 480)
-    cap.set(4, 360)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 480)   
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+    cap.set(cv2.CAP_PROP_FPS, 30)           
 
-    history = deque(maxlen=5)  # 🔥 smoothing
+    history = deque(maxlen=5)
+    frame_count = 0
+    last_results = []  
 
     while True:
         ret, frame = cap.read()
@@ -124,54 +135,49 @@ def main(source, build_db_flag=False):
             break
 
         frame = cv2.flip(frame, 1)
+        frame_count += 1
 
-        results = model(frame, conf=0.5)
+        if frame_count % 2 == 0:
+            last_results = []
+            results = model(frame, conf=0.5, verbose=False)  
 
-        current_labels = []
+            current_labels = []
 
-        for r in results:
-            for box in r.boxes:
-                if int(box.cls[0]) != 0:
-                    continue
+            for r in results:
+                for box in r.boxes:
+                    if int(box.cls[0]) != 0:
+                        continue
 
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    h, w = frame.shape[:2]
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(w, x2), min(h, y2)
 
-                # 🔥 safe crop
-                h, w = frame.shape[:2]
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(w, x2), min(h, y2)
+                    crop = frame[y1:y2, x1:x2]
+                    if crop.size == 0:
+                        continue
 
-                crop = frame[y1:y2, x1:x2]
-                if crop.size == 0:
-                    continue
+                    result = recognize_face(crop, recognizer, id_to_name)
+                    if result is None:
+                        continue
 
-                result = recognize_face(crop, recognizer, id_to_name)
+                    name, conf, (fx, fy, fw, fh), matched = result
+                    ax1, ay1 = x1 + fx, y1 + fy
+                    ax2, ay2 = ax1 + fw, ay1 + fh
+                    score = max(0, 100 - conf)
+                    current_labels.append(name)
 
-                if result is None:
-                    continue
+                    color = (0, 255, 0) if matched else (0, 0, 255)
+                    label = f"{name} ({score:.1f}%)"
+                    last_results.append((ax1, ay1, ax2, ay2, color, label))
 
-                name, conf, (fx, fy, fw, fh), matched = result
+            if current_labels:
+                history.append(current_labels[0])
 
-                # absolute face box
-                ax1 = x1 + fx
-                ay1 = y1 + fy
-                ax2 = ax1 + fw
-                ay2 = ay1 + fh
-
-                score = max(0, 100 - conf)
-
-                current_labels.append(name)
-
-                color = (0, 255, 0) if matched else (0, 0, 255)
-                label = f"{name} ({score:.1f}%)"
-
-                cv2.rectangle(frame, (ax1, ay1), (ax2, ay2), color, 2)
-                cv2.putText(frame, label, (ax1, ay1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-        # 🔥 smoothing (major stability boost)
-        if current_labels:
-            history.append(current_labels[0])
+        for (ax1, ay1, ax2, ay2, color, label) in last_results:
+            cv2.rectangle(frame, (ax1, ay1), (ax2, ay2), color, 2)
+            cv2.putText(frame, label, (ax1, ay1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
         if history:
             stable_name = max(set(history), key=history.count)

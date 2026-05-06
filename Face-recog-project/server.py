@@ -62,15 +62,22 @@ def build_db():
             continue
 
         for file in files:
-            if file.lower().endswith((".jpg", ".png", ".jpeg")):
+            if file.lower().endswith((".jpg", ".png", ".jpeg", ".webp")):
                 path = os.path.join(root, file)
-                img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                print(f"[DB] Processing: {path}")
+
+                img_array = np.fromfile(path, dtype=np.uint8)
+                img = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
+
                 if img is None:
+                    print(f"[DB] Could not read: {path}")
                     continue
 
                 detected = face_cascade.detectMultiScale(
                     img, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40)
                 )
+
+                print(f"[DB] Faces detected in {file}: {len(detected)}")
 
                 if folder_name not in label_dict:
                     label_dict[folder_name] = current_id
@@ -88,6 +95,8 @@ def build_db():
                         face = preprocess_face(face)
                         faces.append(face)
                         labels.append(label_dict[folder_name])
+
+    print(f"[DB] Total faces collected: {len(faces)}")
 
     if len(faces) == 0:
         return False, "No faces found in database"
@@ -133,6 +142,9 @@ class TrainRequest(BaseModel):
 
 @app.post("/train")
 def train(body: TrainRequest):
+    print(f"[AI] Received train request for: {body.person_name}")
+    print(f"[AI] S3 URLs: {body.s3_urls}")
+
     person_dir = os.path.join(DATABASE_PATH, body.person_name)
     os.makedirs(person_dir, exist_ok=True)
 
@@ -140,15 +152,19 @@ def train(body: TrainRequest):
     for url in body.s3_urls:
         try:
             res = requests.get(url, timeout=10)
+            print(f"[AI] Download status for {url}: {res.status_code}")
             if res.status_code == 200:
                 ext = url.split(".")[-1].split("?")[0]
                 filename = f"{len(downloaded)}.{ext}"
                 file_path = os.path.join(person_dir, filename)
                 with open(file_path, "wb") as f:
                     f.write(res.content)
+                print(f"[AI] Saved to: {file_path}")
                 downloaded.append(file_path)
         except Exception as e:
             print(f"[AI] Failed to download {url}: {e}")
+
+    print(f"[AI] Total downloaded: {len(downloaded)}")
 
     if len(downloaded) == 0:
         return JSONResponse(
@@ -157,6 +173,8 @@ def train(body: TrainRequest):
         )
 
     success, result = build_db()
+    print(f"[AI] build_db result: {success}, {result}")
+
     if not success:
         return JSONResponse(status_code=400, content={"error": result})
 
